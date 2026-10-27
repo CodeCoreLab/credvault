@@ -1,0 +1,80 @@
+# CredVault 授权策略（唯一权威源）
+# 语义：deny-by-default / deny 优先 / 未知字段直接报错 / 最具体规则胜出
+# 改完先干跑：credvault policy-check && credvault invoke <能力> --explain --agent <name>
+
+version: 1
+
+defaults:
+  deny_by_default: true
+  allow_private_upstream: false
+  response_bytes: 32768
+  timeout_sec: 20
+  quota_per_min: 60
+  quota_per_day: 2000
+
+# 全局黑名单：任何 agent 都不可用（不可逆动作一律拦在这里）
+deny:
+  - capability: "*delete*"
+    reason: 不可逆的删除类动作走人工通道
+  - capability: "*drop*"
+    reason: 同上
+
+agents:
+  # ── AI 主力 ───────────────────────────────────────────────
+  - id: workbuddy-local
+    label: 本机 WorkBuddy AI
+    allow_exec: false
+    visible_credentials:
+      - DEMO_HTTP_TOKEN
+      - DEMO_WEBHOOK_KEY
+      - ZABBIX_TOKEN
+      - INFLUXDB_TOKEN
+      - WECOM_WEBHOOK_TEST
+    capabilities:
+      - name: demo_echo
+        allow: true
+      - name: zabbix_host_list
+        allow: true
+      - name: influxdb_query
+        allow: true
+      - name: wecom_send_text
+        allow: true
+        require_approval: true      # 写操作：默认要审批
+      - name: "*"
+        allow: false                # 兜底：其余一律拒
+
+  # ── 需要 exec 的运维面（与 AI 主力分开授权，默认不给 AI）────────
+  - id: ops-local
+    label: 运维本机（exec 白名单）
+    allow_exec: true
+    capabilities:
+      - name: host_identity
+        allow: true
+      - name: demo_echo
+        allow: true
+      - name: "*"
+        allow: false
+
+  # ── 只读巡检 ─────────────────────────────────────────────
+  - id: readonly-audit
+    label: 只读巡检 agent
+    allow_exec: false
+    capabilities:
+      - name: zabbix_host_list
+        allow: true
+      - name: influxdb_query
+        allow: true
+      - name: "*"
+        allow: false
+
+  # ── 轮换探针（内部使用，不给外部令牌）────────────────────
+  - id: rotation-probe
+    label: 轮换探针
+    allow_exec: false
+    capabilities:
+      - name: demo_echo
+        allow: true
+      - name: zabbix_host_list
+        allow: true
+      - name: "*"
+        allow: false

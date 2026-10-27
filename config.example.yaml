@@ -1,0 +1,68 @@
+home: null
+
+listen:
+  host: 127.0.0.1
+  port: 8443
+
+kek:
+  source: file
+  path: keys/kek.bin
+  env: CREDVAULT_KEK
+
+store:
+  db: state/credvault.db
+  secrets: state/secrets.db
+
+policy: policy.yaml
+
+capabilities:
+  - capabilities
+
+audit:
+  path: state/audit.jsonl
+  strict: false
+  sink:
+    type: none
+    url: ""
+    timeout_sec: 5
+
+redact:
+  max_hits: 200
+  patterns: []
+
+limits:
+  response_bytes: 32768
+  timeout_sec: 20
+  # 0 = 未设置，跟随 policy.yaml 的 defaults.quota_per_*；非 0 则以本文件为准
+  quota_per_min: 0
+  quota_per_day: 0
+  burst_count: 10
+  burst_window_sec: 60
+  max_body_bytes: 262144
+  # 软限流：默认关闭（超配额硬停）。开启后超配额按 pct 概率放行，其余降速拒绝；
+  # burst 档永不降速（防刷群），且每次现算不复利。
+  throttle_enabled: false
+  throttle_pct: 0.5
+
+approval:
+  ttl_min: 30
+  session_ttl_min: 120
+  notifier:
+    type: none
+    url: ""
+
+exec:
+  enabled: false
+  argv_allowlist: []
+  timeout_sec: 30
+
+kill_switch: false
+
+web:
+  enabled: true
+  session_ttl_min: 480
+  csrf: true
+  # 反代 + HTTPS 时保持 true；本地 http 调试可临时设 false
+  cookie_secure: true
+
+timezone: Asia/Shanghai

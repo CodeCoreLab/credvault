@@ -1,0 +1,30 @@
+[Unit]
+Description=CredVault — AI 主用的凭据平台
+Documentation=https://github.com/your-org/credvault
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=credvault
+Group=credvault
+EnvironmentFile=-/etc/credvault/env
+Environment=CREDVAULT_HOME=/var/lib/credvault
+ExecStart=/usr/local/bin/credvault serve --mode web
+Restart=on-failure
+RestartSec=3
+# 只读根文件系统（数据目录单独挂载）
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/var/lib/credvault
+# 凭据进程禁止 fork 子进程以外的特权
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+# 资源约束
+LimitNOFILE=8192
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

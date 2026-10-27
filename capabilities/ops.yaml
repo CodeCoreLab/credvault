@@ -1,0 +1,153 @@
+# 能力注册表示例 —— 加一段 YAML = 多一个 AI 工具，不改代码、不重启
+#
+# 字段说明：
+#   name            工具名（^[a-z][a-z0-9_]{2,60}$），也是 AI 选工具的依据
+#   description     必填。AI 靠它决定「这件事该不该用这个工具」，写清用途与边界
+#   kind            http | exec
+#   read_only       true=只读（Kill Switch 期间仍放行）；false=写操作
+#   require_confirm 是否需要人工审批（写操作建议 true）
+#   secret_ref      凭据名（只写名字，值由内核注入，AI 永远看不到）
+#   input_schema    JSON Schema 子集（type/properties/required/default/enum/min/max/pattern）
+#   http.method     固定方法，不可被调用参数改写
+#   http.base_url   固定上游基址（协议+主机）
+#   http.path       固定路径，可含 {{ var }} 占位（只替换值，不能改结构）
+#   http.inject     凭据注入方式：header / bearer / basic / query / body
+#   response.json   true=返回体按 JSON 解析并做结构化裁剪（省 token）
+
+version: 1
+capabilities:
+  # ── 自检：不需要凭据的只读能力，用来验证链路通不通 ──────────────
+  - name: demo_echo
+    kind: http
+    description: 平台自检：请求本机 /healthz 并返回结果。用于验证「能力 → 执行器 → 审计」整条链路是否正常。
+    read_only: true
+    tags: [自检]
+    input_schema:
+      type: object
+      properties: {}
+    http:
+      method: GET
+      base_url: http://127.0.0.1:8443
+      path: /healthz
+      allow_private_upstream: true
+    response:
+      json: true
+
+  # ── Zabbix 只读查询 ────────────────────────────────────────────
+  - name: zabbix_host_list
+    kind: http
+    description: 列出 Zabbix 监控主机（只读）。用于晨检、资产盘点、确认某台机器是否在监控里。
+    read_only: true
+    tags: [监控, 只读]
+    secret_ref: ZABBIX_TOKEN
+    input_schema:
+      type: object
+      properties:
+        filter:
+          type: string
+          description: 主机名模糊过滤，省略=全部
+          maxLength: 64
+        limit:
+          type: integer
+          default: 50
+          minimum: 1
+          maximum: 500
+    http:
+      method: POST
+      base_url: https://zabbix.example.com   # 替换为你的 Zabbix 地址
+      path: /api_jsonrpc.php
+      allow_private_upstream: true
+      inject:
+        type: header
+        name: Authorization
+        prefix: "Bearer "
+      headers:
+        Content-Type: application/json-rpc
+      body_template:
+        jsonrpc: "2.0"
+        method: host.get
+        params:
+          output: [hostid, host, status, available]
+          search:
+            host: "{{ filter | default('') }}"
+          limit: "{{ limit | int }}"
+        id: 1
+    response:
+      json: true
+      pick: result
+      array_limit: 50
+
+  # ── InfluxDB 查询 ──────────────────────────────────────────────
+  - name: influxdb_query
+    kind: http
+    description: 查询 InfluxDB 指标（只读）。只允许 SELECT 类语句，写操作会被上游拒绝。
+    read_only: true
+    tags: [监控, 只读]
+    secret_ref: INFLUXDB_TOKEN
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+          description: InfluxQL 查询语句，例如 select * from cpu limit 5
+          maxLength: 800
+        db:
+          type: string
+          default: metrics  # 替换为你的库名
+      required: [query]
+    http:
+      method: GET
+      base_url: http://influxdb.example.com:8086   # 替换为你的 InfluxDB 地址
+      path: /query
+      allow_private_upstream: true
+      query:
+        db: "{{ db }}"
+        q: "{{ query }}"
+      inject:
+        type: query
+        name: p
+
+  # ── 企微推送（写操作，默认需审批）─────────────────────────────
+  - name: wecom_send_text
+    kind: http
+    description: 向企业微信机器人发送纯文本消息（写操作，会产生真实推送）。仅用于测试群与已批准的告警播报。
+    read_only: false
+    require_confirm: true
+    tags: [通知, 写]
+    secret_ref: WECOM_WEBHOOK_TEST
+    input_schema:
+      type: object
+      properties:
+        content:
+          type: string
+          description: 消息正文
+          maxLength: 2000
+      required: [content]
+    http:
+      method: POST
+      base_url: https://qyapi.weixin.qq.com
+      path: /cgi-bin/webhook/send
+      inject:
+        type: query
+        name: key
+      body_template:
+        msgtype: text
+        text:
+          content: "{{ content }}"
+    response:
+      json: true
+
+  # ── 子进程（默认关闭，需 allow_exec + argv 白名单）──────────────
+  - name: host_identity
+    kind: exec
+    description: 取当前主机名，用于确认平台跑在哪台机器上。只允许执行 hostname，不接受任意命令。
+    read_only: true
+    tags: [自检]
+    input_schema:
+      type: object
+      properties: {}
+    exec:
+      argv: ["hostname"]
+      env_var: CREDVAULT_NOOP
+      argv_allowlist: ["hostname"]
+      timeout_sec: 10

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "credvault"
+version = "1.2.0"
+description = "AI 主用、人工辅助的凭据平台：能力注册表 + 信封加密 + 哈希链审计"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "cryptography>=41",
+  "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[project.scripts]
+credvault = "credvault.cli:main"
+
+[tool.setuptools]
+packages = ["credvault", "credvault.cli"]
+
+[tool.setuptools.package-data]
+credvault = ["../capabilities/*.yaml"]
