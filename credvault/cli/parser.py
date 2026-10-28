@@ -23,6 +23,8 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--config", default=None,
                         help="配置文件路径（默认 $CREDVAULT_HOME/config.yaml）")
     common.add_argument("--home", default=None, help="覆盖 CREDVAULT_HOME")
+    common.add_argument("--json", action="store_true",
+                        help="结构化 JSON 输出（敏感值如令牌不落 stdout）")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add(name: str, **kw) -> argparse.ArgumentParser:

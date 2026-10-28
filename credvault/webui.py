@@ -86,6 +86,32 @@ async function post(url, body){
     'X-CSRF':window.CSRF},body:JSON.stringify(body||{})});
   return await r.json().catch(()=>({ok:false,reason:'响应不是 JSON'}));
 }
+
+/* 一次性提示条
+ *
+ * 为什么不用 alert()：
+ *   alert 是阻塞式模态框，令牌明文会一直留在屏幕上，
+ *   直到用户点掉为止 —— 容易被旁边的人、录屏、截屏拍到。
+ *   这里改成页面顶部的一次性横幅：5 秒后自动移除 DOM，
+ *   并提供「复制」按钮，减少令牌被长时间注视的窗口。
+ */
+function flash(text, kind){
+  let box = document.getElementById('flash');
+  if(!box){
+    box = document.createElement('div');
+    box.id = 'flash';
+    box.style.cssText = 'position:fixed;left:50%;top:16px;transform:translateX(-50%);'+
+      'z-index:9999;max-width:min(760px,92vw);padding:12px 16px;border-radius:8px;'+
+      'box-shadow:0 6px 24px rgba(0,0,0,.18);font:13px/1.6 ui-monospace,Consolas,'+
+      'monospace;white-space:pre-wrap;word-break:break-all;background:#1f2328;color:#fff;';
+    document.body.appendChild(box);
+    clearTimeout(window.__flashT);
+    window.__flashT = setTimeout(()=>{ box.remove(); }, 5000);
+  }
+  box.style.background = kind==='err' ? '#a32d2d' : (kind==='warn' ? '#ba7517' : '#1f2328');
+  box.textContent = text;
+}
+
 document.addEventListener('click', async (e)=>{
   const b = e.target.closest('button[data-act]'); if(!b) return;
   const act = b.dataset.act, id = b.dataset.id||'', name = b.dataset.name||'';
@@ -102,9 +128,14 @@ document.addEventListener('click', async (e)=>{
       visible_credentials: document.querySelector('#t-creds').value,
       ip_allowlist: document.querySelector('#t-ips').value});
   else if(act==='clear') r = await post('/api/exemption/clear',{id});
-  if(r && r.token){ alert('令牌（只显示一次）：\\n'+r.token); }
-  if(r && r.message){ alert(r.message); }
-  if(r && !r.ok && r.reason){ alert('失败：'+r.reason); }
+  if(r && r.token){
+    // 令牌只显示这一次：不能立刻 reload，否则横幅一闪而过、用户来不及复制。
+    flash('令牌（只显示一次，5 秒后自动消失）：\\n'+r.token);
+    setTimeout(()=>location.reload(), 5200);
+    return;
+  }
+  if(r && r.message){ flash(r.message); }
+  else if(r && !r.ok && r.reason){ flash('失败：'+r.reason,'err'); }
   if(r && (r.ok!==false)) location.reload();
 });
 """

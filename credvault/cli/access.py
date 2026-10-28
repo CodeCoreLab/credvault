@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import sys
 
 from .. import crypto, policy as policy_mod
 from ..service import LABELS, Service
@@ -22,6 +23,42 @@ def cmd_token(args) -> int:
                 ip_allowlist=_split(args.ips),
                 scope=getattr(args, "scope", "mcp"))
             scope = rec.get("scope", "mcp")
+            if getattr(args, "json", False):
+                # --json：结构化输出，令牌**不落 stdout**。
+                # 理由：stdout 常被 CI 日志、终端录屏、管道缓存收集，
+                # 令牌明文一旦进入日志就等于长期有效凭据外泄。
+                # 这里只把令牌写到 stderr（人眼可见、管道不收），
+                # stdout 保持纯 JSON，便于 `| jq` 直接消费。
+                payload = {
+                    "ok": True,
+                    "action": "add",
+                    "name": rec["name"],
+                    "scope": scope,
+                    "ttl_days": rec["ttl_days"],
+                    "token_redacted": True,
+                    "hint": "令牌只显示一次，已写入 stderr；请立刻配置到客户端",
+                    "client_config": {},
+                }
+                if scope in ("mcp", "both"):
+                    payload["client_config"]["mcp"] = {
+                        "mcpServers": {"credvault": {
+                            "command": _prog(), "args": ["mcp"],
+                            "env": {"CREDVAULT_TOKEN": "<TOKEN>"}}},
+                    }
+                if scope in ("api", "both"):
+                    payload["client_config"]["api"] = {
+                        "header": "Authorization: Bearer <TOKEN>",
+                        "example": 'curl -H "Authorization: Bearer <TOKEN>" '
+                                   'http://127.0.0.1:8443/api/v1/whoami',
+                    }
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+                print(f"\n令牌（只显示这一次，请立刻配置到客户端）：\n{token}\n",
+                      file=sys.stderr)
+                if scope in ("api", "both"):
+                    print(f'  curl -H "Authorization: Bearer {token}" \\\n'
+                          f'       http://127.0.0.1:8443/api/v1/whoami',
+                          file=sys.stderr)
+                return 0
             print(f"✅ agent {rec['name']} 已创建（ttl={rec['ttl_days'] or '永不'} 天，scope={scope}）")
             print(f"\n令牌（只显示这一次，请立刻配置到客户端）：\n{token}\n")
             if scope in ("mcp", "both"):
