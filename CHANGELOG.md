@@ -14,9 +14,18 @@
   stdout 保持纯 JSON，便于 `| jq` 直接消费。所有子命令均可用该参数
 - **WebUI 令牌展示改为一次性横幅**：替代阻塞式 `alert()` 模态框，
   令牌 5 秒后自动从 DOM 移除，并提供复制按钮
+- **已知问题（待修复）**：`credvault init` 在源码目录下不可用 ——
+  `cli/lifecycle.py` 的模板查找路径取 `credvault/` 包目录，而 `policy.yaml`
+  实际位于仓库根，导致策略骨架不落盘、随后 Service 加载策略失败。
+  正式安装路径（`install.sh`）不受影响
 
 ### 修复
 
+- **补齐 `_common` 符号导入，消除运行期 `NameError`**：
+  `cli/access.py` 调用 `_prog()`、`cli/creds.py` 调用 `_import_env()`，
+  但两者都未从 `cli/_common.py` 导入。异常发生在令牌**已创建之后**，
+  用户看到的是「报错了但令牌确实发了」——既拿不到 client_config，
+  也不知道该不该重试。影响 `token add` 与 `cred import-env` 两条路径
 - `capabilities/ops.yaml` 与 `README.md` 中 4 处真实内网信息泄露
   （内网监控地址、数据库名、实例 IP）已替换为 RFC 5737 文档专用网段
   与示例主机名
