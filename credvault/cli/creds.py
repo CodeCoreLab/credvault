@@ -13,7 +13,7 @@ from .. import backup as backup_mod
 from .. import config as config_mod
 from .. import crypto, kinds as kinds_mod, rotate as rotate_mod
 from ..service import Service
-from ._common import _print, _read_value, _svc
+from ._common import _import_env, _print, _read_value, _svc
 
 
 def cmd_cred(args) -> int:

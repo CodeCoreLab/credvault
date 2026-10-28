@@ -9,7 +9,7 @@ import sys
 
 from .. import crypto, policy as policy_mod
 from ..service import LABELS, Service
-from ._common import _agent_from, _print, _split, _svc
+from ._common import _agent_from, _print, _prog, _split, _svc
 
 
 def cmd_token(args) -> int:
