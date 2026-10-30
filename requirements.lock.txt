@@ -1,0 +1,10 @@
+# 依赖锁文件（2026-10-30 治理生成）：真实 venv 安装后 pip freeze 快照。
+# 生成方式: python -m venv → pip install -e . → pip freeze（剔除 -e 本仓自身行）。
+# 用途: 部署环境先 pip install -e . 之外的依赖时参考；直接 pip install -e . 即可。
+# 注意: 按 Python 3.13 / win_amd64 解析；跨平台部署时核对二进制包的平台 wheel。
+
+PyYAML==6.0.3
+cffi==2.1.1
+cryptography==50.0.2
+pip==26.1.2
+pycparser==3.12
