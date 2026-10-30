@@ -52,7 +52,35 @@ def harden(path: Path) -> tuple[bool, str]:
 def perm_ok(path: Path) -> tuple[bool, str]:
     try:
         if os.name == "nt":
-            return True, "windows-acl"
+            # 当前行为：恒返回 (True, "windows-acl") —— os.chmod 在 Windows 只动
+            # 只读位，权限实际由 ACL 决定，这里等于不设防。改用 icacls 反查真实 ACL：
+            # 1) harden() 已 /inheritance:r，若仍见继承型 ACE 说明收紧失败
+            # 2) 授权主体只允许当前用户与 SYSTEM/Administrators（内置管理组）
+            r = subprocess.run(["icacls", str(path)], capture_output=True,
+                               encoding="gb18030", errors="replace", timeout=15)
+            if r.returncode != 0:
+                return False, f"icacls rc={r.returncode}"
+            user = (os.environ.get("USERNAME") or "").upper()
+            ok = True
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                if not line or line.endswith(str(path)) or ":" not in line:
+                    # 首行是文件路径本身；其余形如 "主体:(权限)"
+                    continue
+                ace = line.split(":", 1)[0].strip()
+                # 继承残留形如 "BUILTIN\Administrators" / "NT AUTHORITY\SYSTEM"；
+                # harden() 已 /inheritance:r，出现继承型主体即未收紧
+                if "\\BUILTIN" in ace.upper() or ace.upper().startswith("NT AUTHORITY"):
+                    if "Administrators" in ace or "SYSTEM" in ace.upper():
+                        continue
+                    ok = False
+                    break
+                if "\\" in ace:
+                    # DOMAIN\user 形式：仅当等于当前用户时放行，其余（继承残留）拒绝
+                    if ace.split("\\")[-1].upper() != user:
+                        ok = False
+                        break
+            return (ok, "windows-acl-ok" if ok else "windows-acl-loose")
         mode = path.stat().st_mode & 0o777
         return (mode & 0o077) == 0, oct(mode)
     except OSError as e:

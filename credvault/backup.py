@@ -56,7 +56,11 @@ def export(svc, out_path: Path, password: str) -> dict:
                          for r in svc.store.list_capabilities(enabled_only=False)],
         "secrets": secrets,
         "agents": [{k: v for k, v in a.items() if k != "id"} for a in svc.tokens.list()],
-        "users": [dict(r) for r in svc.store._meta.execute("SELECT * FROM users")],
+        # 当前行为：SELECT * 连 pwd_hash 一起导出 —— PBKDF2 口令哈希随备份包跨机
+        # 流转等于把离线爆破面带出门。只导非敏感三列（恢复端用 `credvault user add` 重建）
+        "users": [{"name": r["name"], "role": r["role"], "created_at": r["created_at"]}
+                  for r in svc.store._meta.execute(
+                      "SELECT name,role,created_at FROM users")],
     }
     salt = os.urandom(16)
     nonce = os.urandom(12)
@@ -135,9 +139,17 @@ def restore(svc, path: Path, password: str, overwrite: bool = False) -> dict:
         if cp.get("name"):
             svc.store.upsert_capability(cp, source="restore")
             caps += 1
+    # users：V1 起备份包已剥离 pwd_hash（只含 name/role/created_at），恢复不建账号；
+    # 旧版包若带 pwd_hash 字段一律忽略，不落库
+    users_meta = 0
+    for u in payload.get("users") or []:
+        if isinstance(u, dict) and u.get("name"):
+            users_meta += 1
     svc.audit.append("system", "restore", True, 0,
                      note=f"restore from {Path(path).name}: cred={added} sec={sec_ok} cap={caps}")
     svc.reload()
     return {"ok": True, "credentials_added": added, "credentials_skipped": skipped,
             "secrets_restored": sec_ok, "capabilities": caps,
-            "note": "token 只恢复元数据（明文哈希不可逆），需在目标机重新签发令牌"}
+            "users_in_backup": users_meta,
+            "note": "token 只恢复元数据（明文哈希不可逆），需在目标机重新签发令牌；"
+                    "用户账号需用 `credvault user add` 重建（备份已剥离口令哈希）"}

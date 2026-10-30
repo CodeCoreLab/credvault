@@ -78,6 +78,12 @@ class Leases:
         if int(rec["expires_at"]) < int(time.time()):
             raise LeaseError("租约已过期，请重新申请")
         allow = json.loads(rec["ip_allowlist"]) if rec["ip_allowlist"] else None
+        # 当前行为：条件是 `if allow and ip` —— ip 为空时白名单检查被整段跳过，
+        # 「没拿到来源 IP」等于「白名单不生效」，fail-closed 变 fail-open。
+        # 改为：声明了白名单但未声明来源 IP → 直接拒绝（与 tokens.resolve 同语义）。
+        if allow and not ip:
+            raise LeaseError(f"租约 {lease_id} 绑定了 IP 白名单 {allow}，"
+                             "但本次 pull 未声明来源 IP（--ip）")
         if allow and ip:
             import fnmatch
             if not any(fnmatch.fnmatchcase(ip, p) for p in allow):

@@ -61,13 +61,24 @@ def cmd_serve(args) -> int:
             print("❌ 需要 CREDVAULT_TOKEN 或 --token", file=sys.stderr)
             return 2
         try:
+            # 当前行为：stdio 入口拿不到来源 IP，若令牌绑定了 IP 白名单会走
+            # fail-closed 被拒。提前探一次，给出可操作的提示（改签无白名单令牌）。
             svc.authenticate(token)
         except Exception as e:  # noqa: BLE001
+            msg = str(e)
+            if "白名单" in msg:
+                print(f"❌ {msg}", file=sys.stderr)
+                print("   stdio 入口无来源 IP：请签发不带 --ips 的令牌用于 MCP stdio。",
+                      file=sys.stderr)
+                return 2
             print(f"❌ {e}", file=sys.stderr)
             return 2
         from ..mcp import serve_stdio
         return serve_stdio(svc, token)
-    from ..web import make_server
+    from ..web import make_server, setup_web_logging
+    # access log 装配：stderr 常开；CREDVAULT_LOG_FILE 非空时追加轮转文件
+    # （RotatingFileHandler 5MB×5）。必须在 make_server 前装，避免早期请求漏记。
+    setup_web_logging(os.getenv("CREDVAULT_LOG_FILE", ""))
     host = args.host or svc.cfg.get("listen.host")
     port = int(args.port or svc.cfg.get("listen.port"))
     httpd = make_server(svc, host, port)
@@ -82,6 +93,8 @@ def cmd_serve(args) -> int:
     finally:
         httpd.server_close()
         svc.close()
+        from ..web import close_web_logging
+        close_web_logging()
     return 0
 
 

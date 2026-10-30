@@ -69,9 +69,37 @@ class Tokens:
         return token, self.get(name) or {}
 
     # ── 解析（fail-closed）──
-    def resolve(self, token: str, ip: str = "") -> dict | None:
+    def resolve(self, token: str, ip: str = "", check_ip: bool = True) -> dict | None:
+        """解析令牌（成功返回 agent，失败返回 None）。
+
+        `check_ip=False` 表示**显式跳过 IP 白名单校验**，只给「没有来源 IP 概念」
+        的本地进程场景用（stdio MCP / 本地 CLI）。这类场景过去靠硬编码
+        "127.0.0.1" 伪装成回环 —— 那样白名单形同虚设（配了 127.0.0.1 也永远匹配成功），
+        改成显式跳过才符合「白名单只对有来源 IP 的入口生效」的语义。
+        """
+        agent, _reason, _name = self.resolve_ex(token, ip, check_ip=check_ip)
+        return agent
+
+    def resolve_ex(self, token: str, ip: str = "", check_ip: bool = True
+                   ) -> tuple[dict | None, str, str]:
+        """带失败原因的解析：返回 (agent|None, reason, agent_name)。
+
+        当前行为：`resolve()` 对「令牌不存在 / 已吊销 / 已过期 / IP 不在白名单」
+        四条失败路径一律 `return None`，调用方无从区分是哪一种 —— 于是鉴权失败
+        既无法落审计，也没法告诉调用方到底是哪一步被拒。
+
+        reason 取值：
+          ""          成功
+          "missing"   未提供令牌
+          "not_found" 令牌不存在（哈希不匹配）
+          "revoked"   已吊销
+          "expired"   已过期
+          "ip_denied" 来源 IP 不在白名单（含「IP 为空」的情形）
+          "db_error"  令牌库读取异常
+        agent_name：能定位到 agents 行时的令牌名（失败时也可能非空，便于审计定位）。
+        """
         if not token:
-            return None
+            return None, "missing", ""
         tok = token.strip()
         if tok.lower().startswith("bearer "):
             tok = tok[7:].strip()
@@ -79,22 +107,26 @@ class Tokens:
             r = self.s._meta.execute("SELECT * FROM agents WHERE token_hash=?",
                                      (_hash(tok),)).fetchone()
         except Exception:  # noqa: BLE001 —— 令牌库损坏不等于"无令牌"，但对外一律 fail-closed
-            return None
+            return None, "db_error", ""
         if not r:
-            return None
+            return None, "not_found", ""
         row = dict(r)
+        name = str(row.get("name") or "")
         if row["revoked"]:
-            return None
+            return None, "revoked", name
         if row["expires_at"] and int(row["expires_at"]) < now():
-            return None
+            return None, "expired", name
         allow = json.loads(row["ip_allowlist"]) if row["ip_allowlist"] else None
-        if allow and ip:
+        if allow and check_ip:
             import fnmatch
-            if not any(fnmatch.fnmatchcase(ip, p) for p in allow):
-                return None
+            # 当前行为：条件是 `if allow and ip` —— ip 为空时整段白名单检查被跳过，
+            # 于是「没拿到来源 IP」等于「白名单不生效」，fail-closed 变成 fail-open。
+            # 改为：只要配了白名单，ip 为空即视为不匹配任何 pattern → 拒绝。
+            if not ip or not any(fnmatch.fnmatchcase(ip, p) for p in allow):
+                return None, "ip_denied", name
         with self.s.tx() as c:
             c.execute("UPDATE agents SET last_used_at=? WHERE id=?", (now(), row["id"]))
-        return self._shape(row)
+        return self._shape(row), "", name
 
     def _shape(self, row: dict) -> dict:
         # sqlite3.Row 支持 keys() 但不支持 get()，故统一用 keys() 探测
@@ -122,6 +154,18 @@ class Tokens:
                 self.s._meta.execute("SELECT * FROM agents ORDER BY created_at DESC")]
 
     # ── 生命周期 ──
+    # 可更新字段 → 列名 的**固定白名单**。
+    # 当前行为：update_scopes 用 f-string 拼 UPDATE 语句（`,'.join(sets)`）。
+    # 今天的 sets 元素来自固定分支字面量，注入不了；但模式本身危险 ——
+    # 任何人日后加一个「列名来自入参」的分支就变成真注入。
+    # 改为：列名一律从本白名单查表得到，用户可控的值只进参数位。
+    FIELD_MAP = {
+        "scope": "scope",
+        "visible_credentials": "visible_credentials",
+        "allowed_capabilities": "allowed_capabilities",
+        "ip_allowlist": "ip_allowlist",
+    }
+
     def revoke(self, name: str) -> bool:
         with self.s.tx() as c:
             cur = c.execute("UPDATE agents SET revoked=1 WHERE name=? AND revoked=0", (name,))
@@ -143,17 +187,28 @@ class Tokens:
                       allowed_capabilities: list[str] | None = None,
                       ip_allowlist: list[str] | None = None,
                       scope: str | None = None) -> bool:
+        """更新令牌的双轴授权与 scope。
+
+        当前行为：用 f-string 拼 SQL（`f"UPDATE agents SET {','.join(sets)} ..."`）。
+        列名来源虽已是固定字面量，但拼接模式本身是注入的温床 ——
+        改为：列名一律走 FIELD_MAP 白名单查表，值只进参数位（?占位符）。
+        行为保持不变。
+        """
         sets, args = [], []
         if scope is not None:
             if scope not in self.SCOPES:
                 raise TokenError(f"scope 必须是 {self.SCOPES} 之一，收到 {scope!r}")
-            sets.append("scope=?"); args.append(scope)
+            sets.append(f"{self.FIELD_MAP['scope']}=?")
+            args.append(scope)
         if visible_credentials is not None:
-            sets.append("visible_credentials=?"); args.append(json.dumps(visible_credentials))
+            sets.append(f"{self.FIELD_MAP['visible_credentials']}=?")
+            args.append(json.dumps(visible_credentials))
         if allowed_capabilities is not None:
-            sets.append("allowed_capabilities=?"); args.append(json.dumps(allowed_capabilities))
+            sets.append(f"{self.FIELD_MAP['allowed_capabilities']}=?")
+            args.append(json.dumps(allowed_capabilities))
         if ip_allowlist is not None:
-            sets.append("ip_allowlist=?"); args.append(json.dumps(ip_allowlist))
+            sets.append(f"{self.FIELD_MAP['ip_allowlist']}=?")
+            args.append(json.dumps(ip_allowlist))
         if not sets:
             return False
         args.append(name)

@@ -9,10 +9,14 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import secrets
+import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from . import api as api_mod
 from . import kinds as kinds_mod
@@ -23,6 +27,65 @@ from .store import now
 
 COOKIE = "cvsid"
 SESSIONS: dict[str, dict] = {}
+
+# ── access log（v1.2 曾整体静音，排障无据；这里恢复为走 logging）─────────────
+# 独立 logger "credvault.web"：默认 stderr（服务启动处装 handler），可另配文件
+# （环境变量 CREDVAULT_LOG_FILE，RotatingFileHandler 5MB×5）。query string 可能
+# 带 token/密码等敏感参数，先脱敏再落盘。
+_WEB_LOGGER = logging.getLogger("credvault.web")
+_SENSITIVE_QS = {"token", "password", "passwd", "pwd", "secret", "key", "apikey",
+                 "access_token", "auth", "sig", "signature", "code"}
+
+
+def _redact_query(qs: str) -> str:
+    """query string 脱敏：敏感键的值替换为 ***（保留键名便于排障）。"""
+    if not qs:
+        return ""
+    out = []
+    for pair in qs.split("&"):
+        k, _, v = pair.partition("=")
+        if k.lower() in _SENSITIVE_QS and v:
+            out.append(f"{k}=***")
+        else:
+            out.append(pair)
+    return "&".join(out)
+
+
+def setup_web_logging(log_file: str = "") -> None:
+    """服务启动处调用：装 stderr handler；log_file 非空时再加轮转文件 handler。
+
+    RotatingFileHandler：单文件 5MB、保留 5 份。幂等（重复调用不重复挂）。
+    """
+    logger = logging.getLogger("credvault.web")
+    if logger.handlers:
+        return  # 已初始化
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    sh = logging.StreamHandler()  # stderr
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    if log_file:
+        try:
+            Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+            fh = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024,
+                                     backupCount=5, encoding="utf-8")
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
+        except OSError:
+            pass  # 文件不可用时保持 stderr-only，不阻断启动
+
+
+def close_web_logging() -> None:
+    """进程退出前调用：flush 并关闭文件句柄（stderr handler 无需关）。"""
+    logger = logging.getLogger("credvault.web")
+    for h in logger.handlers:
+        try:
+            h.flush()
+            if not isinstance(h, logging.StreamHandler) or h.stream.name != "<stderr>":
+                h.close()
+        except Exception:  # noqa: BLE001
+            pass
+    logger.handlers.clear()
 
 # 登录失败限速（M3）：内存滑动窗口。进程重启清零是可接受代价——爆破需要持续在线
 _LOGIN_FAILS: dict[str, list[float]] = {}
@@ -93,8 +156,28 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     # ── 基础设施 ──
-    def log_message(self, fmt: str, *args) -> None:  # 静音默认 access log
-        pass
+    def log_message(self, fmt: str, *args) -> None:
+        """access log：恢复输出（v1.2 是 `pass` 静音）。
+
+        走 logger "credvault.web"（stderr + 可选轮转文件，见 setup_web_logging）。
+        BaseHTTPRequestHandler 传进来的 args 里第一个 %s 是请求行
+        （如 "GET /path?key=val HTTP/1.1"），其中的 query string 可能带敏感值，
+        先脱敏再落盘。日志失败不阻断请求。
+        """
+        try:
+            args2 = list(args)
+            if args2:
+                line = str(args2[0])
+                # 请求行形如 "GET /path?x=1 HTTP/1.1"：剥出 path+query 脱敏后拼回
+                parts = line.split(" ")
+                if len(parts) >= 2:
+                    target = parts[1]
+                    tpath, _, tqs = target.partition("?")
+                    parts[1] = f"{tpath}?{_redact_query(tqs)}" if tqs else tpath
+                    args2[0] = " ".join(parts)
+            _WEB_LOGGER.info("%s - %s", self.client_address[0], fmt % tuple(args2))
+        except Exception:  # noqa: BLE001 —— 日志失败不阻断请求
+            pass
 
     def _send(self, code: int, body: bytes, ctype: str = "text/html; charset=utf-8",
               headers: dict | None = None) -> None:
@@ -103,6 +186,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+        # CSP：与 webui 的 XSS 转义配合收口。页面无外链资源，脚本经 <script>{_JS}</script>
+        # 内联注入（'unsafe-inline' 仅覆盖内联脚本/样式），禁止 frame 嵌套与 base 劫持。
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; script-src 'unsafe-inline'; "
+                         "style-src 'unsafe-inline'; img-src 'self' data:; "
+                         "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'")
+        self.send_header("X-Frame-Options", "DENY")
         for k, v in (headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -301,14 +391,25 @@ class Handler(BaseHTTPRequestHandler):
         """
         auth = self.headers.get("Authorization") or ""
         token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        ip = self.client_address[0]
         sub = path[len(api_mod.API_PREFIX):] or "/"
         try:
             status, payload = api_mod.handle(
-                self.svc_ref, method, sub, query, body, token, self.client_address[0])
+                self.svc_ref, method, sub, query, body, token, ip)
         except Exception as e:  # noqa: BLE001 —— 绝不把栈泄给外部调用方
             status, payload = 500, {"ok": False, "code": 17,
                                     "reason": f"{type(e).__name__}: {str(e)[:200]}",
                                     "next_action": "查服务端日志；不要把本次请求当成功"}
+        # 当前行为：鉴权失败（401）时 api.handle 直接 return，审计链不留痕，
+        # 爆破/扫令牌完全不可见。补一条 api.auth 失败审计：
+        # actor 带 IP、note 只记 reason 摘要（不含令牌内容）。
+        if status == 401:
+            try:
+                self.svc_ref.audit.append(
+                    f"api-anon:{ip}", "api.auth", False, 0, capability=sub,
+                    note=str(payload.get("reason", ""))[:200])
+            except Exception:  # noqa: BLE001 —— 审计失败不影响响应
+                pass
         return self._json(status, payload)
 
     # ── 登录 ──
@@ -316,17 +417,18 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body()
         name = str(body.get("user", "")).strip()
         pwd = str(body.get("password", ""))
-        key = f"{self.client_address[0]}|{name}"
+        ip = self.client_address[0]
+        key = f"{ip}|{name}"
         if login_blocked(key):
             self.svc_ref.audit.append(f"human:{name or '-'}", "login", False, 0,
-                                  note=f"RATE-LIMITED ip={self.client_address[0]}")
+                                  note=f"RATE-LIMITED ip={ip}")
             return self._send(429, webui.page_login("失败次数过多，请 5 分钟后再试").encode())
         row = self.svc_ref.store._meta.execute(
             "SELECT * FROM users WHERE name=?", (name,)).fetchone()
         if not row or not verify_password(pwd, row["pwd_hash"]):
             n = login_fail(key)
             self.svc_ref.audit.append(f"human:{name or '-'}", "login", False, 0,
-                                  note=f"bad credentials (fail {n}/{_LOGIN_MAX})")
+                                  note=f"bad credentials ip={ip} (fail {n}/{_LOGIN_MAX})")
             return self._send(401, webui.page_login("用户名或密码错误").encode())
         sid = secrets.token_urlsafe(24)
         csrf = secrets.token_urlsafe(16)
@@ -348,12 +450,20 @@ class Handler(BaseHTTPRequestHandler):
     def _mcp(self) -> None:
         auth = self.headers.get("Authorization") or ""
         token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        ip = self.client_address[0]
         if not token:
+            # 当前行为：无令牌直接 401，不留审计。补一条（不记令牌内容）。
+            self.svc_ref.audit.append(f"mcp-anon:{ip}", "mcp.auth", False, 0,
+                                      note="缺少 Bearer Token")
             return self._json(401, {"jsonrpc": "2.0", "id": None,
                                     "error": {"code": -32001, "message": "缺少 Bearer Token"}})
         try:
-            ag = self.svc_ref.authenticate(token, self.client_address[0])
+            ag = self.svc_ref.authenticate(token, ip)
         except Exception as e:  # noqa: BLE001
+            # 当前行为：坏令牌直接 401，不留审计。补一条：只记异常类型与来源 IP，
+            # 不记令牌内容（明文/哈希都不落审计）。
+            self.svc_ref.audit.append(f"mcp-anon:{ip}", "mcp.auth", False, 0,
+                                      note=f"{type(e).__name__}")
             return self._json(401, {"jsonrpc": "2.0", "id": None,
                                     "error": {"code": -32001, "message": str(e)}})
         # scope 校验：scope=api 的令牌不得走 MCP 入口（与 /api/v1 反向对称）

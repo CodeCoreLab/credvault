@@ -125,18 +125,23 @@ INTROSPECTION = [
 
 
 class Mcp:
-    def __init__(self, svc, token: str, ip: str = "127.0.0.1", allow_impersonate: bool = False):
+    def __init__(self, svc, token: str, ip: str = "127.0.0.1", allow_impersonate: bool = False,
+                 _skip_ip_check: bool = False):
         self.svc = svc
         self.token = token
         self.ip = ip
         # F4：MCP 侧默认**不接受** on_behalf_of（防 agent 自封代办人）
         self.allow_impersonate = allow_impersonate
+        # stdio 入口专用：没有来源 IP 概念，显式跳过 IP 白名单（check_ip=False），
+        # 而不是靠硬编码 127.0.0.1 伪装回环。HTTP 入口不传此参，白名单照常生效。
+        self._skip_ip_check = _skip_ip_check
         self._agent: dict | None = None
 
     # ── 身份（懒加载，调用期才失败，便于客户端先完成握手）──
     def agent(self) -> dict:
         if self._agent is None:
-            self._agent = self.svc.authenticate(self.token, self.ip)
+            self._agent = self.svc.authenticate(self.token, self.ip,
+                                                check_ip=not self._skip_ip_check)
         return self._agent
 
     # ── 工具清单 ──
@@ -338,7 +343,12 @@ def _prompt_get(name: str, svc, agent: dict) -> dict:
 
 # ── stdio 主循环 ────────────────────────────────────────────────────────
 def serve_stdio(svc, token: str, ip: str = "127.0.0.1") -> int:
-    mcp = Mcp(svc, token, ip)
+    # 当前行为：Mcp 默认 ip="127.0.0.1" 是「伪装回环」——若令牌恰好绑定了
+    # 127.0.0.1 白名单则永远匹配，白名单形同虚设；而绑定其它 IP 的令牌在
+    # stdio 入口因 check_ip 走 fail-closed 也会被误拒。stdio 是本地进程间
+    # 通道、没有来源 IP 概念，故显式 check_ip=False 跳过白名单（语义：
+    # 白名单只对有来源 IP 的入口生效）。
+    mcp = Mcp(svc, token, ip, _skip_ip_check=True)
     out = sys.stdout
     for line in sys.stdin:
         line = line.strip()

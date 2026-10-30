@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import http.client
 import ipaddress
+import logging
 import os
 import socket
 import subprocess
@@ -22,6 +23,11 @@ MAX_POOL = 32
 _POOL: dict[tuple, http.client.HTTPConnection] = {}
 _POOL_ORDER: list[tuple] = []
 _POOL_LOCK = threading.Lock()
+
+# ── 静默失败可见化（原为裸 `except: pass`，连接异常/关闭失败完全无痕）────────
+# 用 logging 而非落文件：本模块被 CLI/服务/测试多处导入，logging 默认无 handler
+# 时不输出，测试零噪音；服务端装了 handler（如 "credvault.web"）后即可见。
+_LOG = logging.getLogger("credvault.executor")
 
 
 class ExecError(RuntimeError):
@@ -88,8 +94,8 @@ class _PinnedHTTPS(http.client.HTTPSConnection):
         # 上面的 super().connect() 已用 IP 完成 TCP + 默认 SNI 握手；此处重建以带正确 SNI
         try:
             self.sock.close()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001 —— 关旧 socket 失败不影响重建
+            _LOG.debug("SNI 重建时关闭旧 socket 失败: %s", e)
         self.sock = self._create_connection((self.host, self.port), self.timeout,
                                             self.source_address)
         self.sock = self._context.wrap_socket(self.sock, server_hostname=self._sni)
@@ -115,8 +121,8 @@ def _get_conn(scheme: str, host: str, port: int, timeout: int,
             if oldc is not None:
                 try:
                     oldc.close()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as e:  # noqa: BLE001 —— 淘汰连接关闭失败不阻断建新连接
+                    _LOG.debug("连接池淘汰 %s 关闭失败: %s", old, e)
         _POOL[key] = conn
         _POOL_ORDER.append(key)
         return conn
@@ -130,8 +136,8 @@ def _drop_conn(key: tuple) -> None:
     if c is not None:
         try:
             c.close()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001 —— 摘除时关闭失败只记日志
+            _LOG.debug("连接 %s 摘除关闭失败: %s", key, e)
 
 
 def close_pool() -> int:
@@ -140,8 +146,8 @@ def close_pool() -> int:
         for c in _POOL.values():
             try:
                 c.close()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001 —— 清池时关闭失败只记日志
+                _LOG.debug("连接池清空关闭失败: %s", e)
         _POOL.clear()
         _POOL_ORDER.clear()
     return n
@@ -173,6 +179,10 @@ def http_request(url: str, method: str = "GET", headers: dict | None = None,
         except (http.client.HTTPException, OSError) as e:
             last = e
             _drop_conn(key)
+            # 当前行为：重试耗尽前的连接失败无任何记录，排障只能靠最终异常。
+            # 记 warning（含主机与尝试次数，不含注入凭据）。
+            _LOG.warning("HTTP 请求失败 %s（第 %d/%d 次）: %s",
+                         key[1], i + 1, attempts, f"{type(e).__name__}: {e}")
             if i + 1 >= attempts:
                 break
     raise ExecError(f"{type(last).__name__}: {last}")
@@ -220,10 +230,18 @@ def run_exec(argv: list[str], inject: dict[str, str], allowlist: list[str],
                            encoding=("gb18030" if os.name == "nt" else "utf-8"),
                            errors="replace", timeout=timeout,
                            env=sanitized_env(inject), cwd=cwd or None)
+        if p.returncode != 0:
+            # 当前行为：子进程非零退出只把 stderr 交回调用方，服务端无痕。
+            # 记 debug：argv 可能有敏感参数，debug 级别避免常规部署外泄。
+            _LOG.debug("exec rc=%d argv=%s stderr=%.300s", p.returncode, argv,
+                       p.stderr or "")
         return p.returncode, p.stdout or "", p.stderr or ""
     except subprocess.TimeoutExpired as e:
+        # 当前行为：超时吞掉原异常换 ExecError，服务端无痕。记 warning。
+        _LOG.warning("exec 超时（%ds）argv=%s", timeout, argv)
         raise ExecError(f"执行超时（{timeout}s）") from e
     except FileNotFoundError as e:
+        _LOG.warning("exec 命令不存在: %s", e)
         raise ExecError(f"命令不存在: {e}") from e
 
 

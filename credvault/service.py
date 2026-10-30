@@ -121,10 +121,22 @@ class Service:
         self.store.close()
 
     # ── 身份 ──
-    def authenticate(self, token: str, ip: str = "") -> dict:
-        ag = self.tokens.resolve(token, ip)
+    def authenticate(self, token: str, ip: str = "", check_ip: bool = True) -> dict:
+        # 当前行为：resolve 对「不存在/吊销/过期/IP 拒绝」一律返回 None，
+        # 调用方只能收到一句笼统提示，审计也无法区分失败原因。
+        # 改用 resolve_ex 拿失败原因，把 reason 拼进异常文本（对外仍 fail-closed）。
+        # check_ip=False：stdio/CLI 等无来源 IP 概念的本地入口显式跳过白名单。
+        ag, reason, name = self.tokens.resolve_ex(token, ip, check_ip=check_ip)
         if not ag:
-            raise AuthError("令牌无效、已吊销、已过期，或来源 IP 不在白名单（fail-closed）")
+            detail = {
+                "missing": "未提供令牌",
+                "not_found": "令牌不存在",
+                "revoked": f"令牌已吊销" + (f"（{name}）" if name else ""),
+                "expired": f"令牌已过期" + (f"（{name}）" if name else ""),
+                "ip_denied": "来源 IP 不在白名单",
+                "db_error": "令牌库读取异常",
+            }.get(reason, "令牌无效、已吊销、已过期，或来源 IP 不在白名单（fail-closed）")
+            raise AuthError(f"令牌无效（{detail}）")
         return ag
 
     # ── 渐进披露 ──

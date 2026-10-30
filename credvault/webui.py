@@ -2,12 +2,21 @@
 
 从 web.py 拆出的原因：路由层（鉴权/CSRF/探针/JSON API）与渲染层混在 508 行的单文件里，
 改样式会碰到鉴权代码的上下文，违背「变更半径最小」。此处只允许纯渲染，便于独立改版。
+
+XSS 约定：任何来自数据库/审计/用户输入的字符串进 HTML 前必须过 `_esc`。
+审计 note、args_preview、能力名、agent 名都是攻击面（凭据名可由用户自由命名）。
 """
 from __future__ import annotations
 
+import html
 import json
 
 from .store import now
+
+
+def _esc(v) -> str:
+    """HTML 转义（含引号，供属性上下文使用）。None/缺字段渲染为空串。"""
+    return html.escape(str(v if v is not None else ""), quote=True)
 
 
 _CSS = """
@@ -50,10 +59,12 @@ h2{font-size:15px;font-weight:600;margin:0 0 10px}
 
 
 def _shell(active: str, body: str, s: dict | None = None) -> str:
-    who = f'<span class="hint">已登录 {s["user"]}（{s["role"]}）</span>' if s else ""
+    # XSS：user/role 来自 users 表（用户名可含 HTML 元字符），进属性/文本前一律转义
+    who = (f'<span class="hint">已登录 {_esc(s["user"])}（{_esc(s["role"])}）</span>'
+           if s else "")
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CredVault · {active}</title><style>{_CSS}</style></head><body>
+<title>CredVault · {_esc(active)}</title><style>{_CSS}</style></head><body>
 <header><b>CredVault</b>
 <nav><a href="/approvals" class="{'on' if active=='待审批' else ''}">待审批</a>
 <a href="/audit" class="{'on' if active=='审计' else ''}">审计</a>
@@ -66,7 +77,8 @@ def _shell(active: str, body: str, s: dict | None = None) -> str:
 
 
 def page_login(err: str = "") -> str:
-    msg = f'<p class="bad">{err}</p>' if err else ""
+    # XSS：err 由服务端拼好再传入，仍按不可信处理（quote=True 覆盖属性上下文）
+    msg = f'<p class="bad">{_esc(err)}</p>' if err else ""
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>CredVault · 登录</title><style>{_CSS}</style></head><body>
 <main style="max-width:380px;margin:80px auto">
@@ -145,20 +157,21 @@ def page_approvals(s: dict, svc) -> str:
     pend = svc.approvals.pending()
     ex = svc.approvals.exemptions()
     rows = "".join(
-        f"""<tr><td class="mono">{a['id']}</td><td>{a['capability']}</td>
-<td>{a['requested_by']}</td><td class="mono">{a['args_preview'][:110]}</td>
-<td>{a['remaining_sec']//60} 分钟</td>
-<td><label class="hint"><input type="checkbox" id="sess-{a['id']}"
+        # XSS：id/capability/requested_by/args_preview 都来自 DB，args_preview 含用户参数原文
+        f"""<tr><td class="mono">{_esc(a['id'])}</td><td>{_esc(a['capability'])}</td>
+<td>{_esc(a['requested_by'])}</td><td class="mono">{_esc(a['args_preview'][:110])}</td>
+<td>{_esc(a['remaining_sec']//60)} 分钟</td>
+<td><label class="hint"><input type="checkbox" id="sess-{_esc(a['id'])}"
  style="width:auto;margin-right:4px">会话豁免</label></td>
-<td><button class="p" data-act="approve" data-id="{a['id']}">批准</button>
-<button class="d" data-act="reject" data-id="{a['id']}">拒绝</button></td></tr>"""
+<td><button class="p" data-act="approve" data-id="{_esc(a['id'])}">批准</button>
+<button class="d" data-act="reject" data-id="{_esc(a['id'])}">拒绝</button></td></tr>"""
         for a in pend)
     if not rows:
         rows = '<tr><td colspan="7" class="hint">没有待审批项</td></tr>'
     ex_rows = "".join(
-        f'<tr><td class="mono">{e["id"]}</td><td>{e["capability"]}</td>'
-        f'<td>{e["agent_id"]}</td><td>{max(0,e["expires_at"]-now())//60} 分钟</td>'
-        f'<td><button data-act="clear" data-id="{e["id"]}">撤销</button></td></tr>'
+        f'<tr><td class="mono">{_esc(e["id"])}</td><td>{_esc(e["capability"])}</td>'
+        f'<td>{_esc(e["agent_id"])}</td><td>{_esc(max(0,e["expires_at"]-now())//60)} 分钟</td>'
+        f'<td><button data-act="clear" data-id="{_esc(e["id"])}">撤销</button></td></tr>'
         for e in ex) or '<tr><td colspan="5" class="hint">无</td></tr>'
     body = f"""<h2>待审批（{len(pend)}）</h2>
 <div class="card" style="padding:0;overflow:hidden"><table>
@@ -176,11 +189,14 @@ def page_audit(s: dict, svc) -> str:
     st = svc.audit.stats(now() - 86400)
     rows = svc.audit.search(limit=120)
     trs = "".join(
-        f"<tr><td class='mono'>{r.get('ts','')[11:19]}</td><td>{r.get('actor','')}</td>"
-        f"<td>{r.get('capability') or r.get('tool','')}</td>"
-        f"<td class='mono'>{r.get('credential','')}</td>"
+        # XSS：actor/capability/credential/note 都是审计面攻击点（note 含失败原因原文）
+        f"<tr><td class='mono'>{_esc(r.get('ts','')[11:19])}</td>"
+        f"<td>{_esc(r.get('actor',''))}</td>"
+        f"<td>{_esc(r.get('capability') or r.get('tool',''))}</td>"
+        f"<td class='mono'>{_esc(r.get('credential',''))}</td>"
         f"<td class='{'ok' if r.get('ok') else 'bad'}'>{'成功' if r.get('ok') else '失败'}</td>"
-        f"<td>{r.get('dur_ms',0)}</td><td class='hint'>{(r.get('note') or '')[:90]}</td></tr>"
+        f"<td>{_esc(r.get('dur_ms',0))}</td>"
+        f"<td class='hint'>{_esc((r.get('note') or '')[:90])}</td></tr>"
         for r in rows) or '<tr><td colspan="7" class="hint">暂无记录</td></tr>'
     ok, note, n = svc.audit.verify()
     body = f"""<div class="grid">
@@ -204,13 +220,14 @@ def page_tokens(s: dict, svc) -> str:
     agents = svc.tokens.list()
     caps = [c.name for c in svc.caps]
     rows = "".join(
-        f"<tr><td class='mono'>{a['name']}</td>"
+        # XSS：agent 名由用户自由命名（可含引号/尖括号），属性上下文必须带引号转义
+        f"<tr><td class='mono'>{_esc(a['name'])}</td>"
         f"<td>{'已吊销' if a['revoked'] else ('过期' if a['expires_at'] and a['expires_at']<now() else '有效')}</td>"
-        f"<td class='mono'>{a['expires_at'] or '永不'}</td>"
-        f"<td class='mono'>{(a['allowed_capabilities'] or ['全部'])[:4] if isinstance(a['allowed_capabilities'],list) else '全部'}</td>"
-        f"<td class='mono'>{a['visible_credentials'] or '全部'}</td>"
-        f"<td><button data-act='rotate' data-name='{a['name']}'>轮换</button>"
-        f"<button class='d' data-act='revoke' data-name='{a['name']}'>吊销</button></td></tr>"
+        f"<td class='mono'>{_esc(a['expires_at'] or '永不')}</td>"
+        f"<td class='mono'>{_esc((a['allowed_capabilities'] or ['全部'])[:4] if isinstance(a['allowed_capabilities'],list) else '全部')}</td>"
+        f"<td class='mono'>{_esc(a['visible_credentials'] or '全部')}</td>"
+        f"<td><button data-act='rotate' data-name='{_esc(a['name'])}'>轮换</button>"
+        f"<button class='d' data-act='revoke' data-name='{_esc(a['name'])}'>吊销</button></td></tr>"
         for a in agents) or '<tr><td colspan="6" class="hint">还没有令牌</td></tr>'
     body = f"""<h2>签发令牌</h2>
 <div class="card">
@@ -226,7 +243,7 @@ def page_tokens(s: dict, svc) -> str:
 <div class="card" style="padding:0;overflow:hidden"><table>
 <tr><th>名称</th><th>状态</th><th>到期</th><th>能力范围</th><th>可见凭据</th><th>动作</th></tr>
 {rows}</table></div>
-<p class="hint">可用能力共 {len(caps)} 个：<span class="mono">{', '.join(sorted(caps)[:18])}</span></p>
+<p class="hint">可用能力共 {len(caps)} 个：<span class="mono">{_esc(', '.join(sorted(caps)[:18]))}</span></p>
 <script>{_JS}</script>"""
     return _shell("令牌", body, s)
 

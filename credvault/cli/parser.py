@@ -62,6 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--ips", help="IP 白名单")
     s.add_argument("--scope", default="mcp", choices=["mcp", "api", "both"],
                    help="令牌可用的入口：mcp（默认）/ api（REST）/ both")
+    s.add_argument("--set-scope", default=None, choices=["mcp", "api", "both"],
+                   help="scopes 子命令：改入口授权；不传=不改")
     s.set_defaults(func=cmd_token)
 
     s = add("approval", help="审批")

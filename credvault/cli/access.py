@@ -85,9 +85,21 @@ def cmd_token(args) -> int:
             print("✅ 已吊销" if svc.tokens.revoke(args.name) else "❌ 不存在或已吊销")
             return 0
         if args.action == "scopes":
-            ok = svc.tokens.update_scopes(args.name, _split(args.creds), _split(args.caps),
-                                          _split(args.ips))
-            print("✅ 已更新" if ok else "❌ 未更新")
+            # 当前行为：直接透传列表，`--creds "a,,b"`（连续逗号）会把空串写进
+            # 授权轴；scope 拼错值只在 DB 层报错。先做白名单/空项校验再更新。
+            if getattr(args, "set_scope", None) is not None and args.set_scope not in ("mcp", "api", "both"):
+                print(f"❌ scope 必须是 mcp/api/both 之一，收到 {args.set_scope!r}")
+                return 1
+            lists = {"--creds": _split(args.creds), "--caps": _split(args.caps),
+                     "--ips": _split(args.ips)}
+            for flag, items in lists.items():
+                if items is not None and any(not x.strip() for x in items):
+                    print(f"❌ {flag} 含空项（连续逗号？），拒绝整批更新")
+                    return 1
+            ok = svc.tokens.update_scopes(args.name, lists["--creds"], lists["--caps"],
+                                          lists["--ips"],
+                                          scope=getattr(args, "set_scope", None))
+            print("✅ 已更新" if ok else "❌ 未更新（agent 不存在或没有任何变更项）")
             return 0
     finally:
         svc.close()

@@ -51,7 +51,13 @@ def _read_value(args) -> str:
 
 def _agent_from(svc, args) -> dict:
     if getattr(args, "token", ""):
-        return svc.authenticate(args.token)
+        # 当前行为：绑定 IP 白名单的令牌在 CLI/stdio（无来源 IP）会因 fail-closed
+        # 被拒，但报错笼统。提前探明并给出可操作提示（改签无白名单令牌）。
+        ag = svc.authenticate(args.token, check_ip=False)
+        if ag.get("ip_allowlist"):
+            raise SystemExit("该令牌绑定了 IP 白名单，CLI/stdio 入口无法声明来源 IP，拒绝使用；"
+                             "请改签不带 --ips 的令牌")
+        return ag
     if getattr(args, "agent", ""):
         a = svc.tokens.get(args.agent)
         if not a or a["revoked"]:
