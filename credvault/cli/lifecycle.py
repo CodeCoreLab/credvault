@@ -23,7 +23,15 @@ def cmd_init(args) -> int:
     kek = crypto.load_kek(cfg.get("kek.source"), cfg.path("kek.path"),
                           cfg.get("kek.env"), create=True)
     # 首次落一份可用的配置/策略/能力骨架，做到「解压即跑」
+    # 模板位置：安装态（pip/install.sh）在包目录旁；源码态在仓库根
+    # （policy.yaml / capabilities/ / config.example.yaml 都在仓库根）。
+    # 只认包目录会让「源码目录下跑 init」静默不落策略，随后 Service 加载失败
+    # （CHANGELOG 1.2.0「已知问题」即此）。两条候选按序探测，取第一个命中的。
     tpl = Path(__file__).resolve().parent.parent
+    for cand in (tpl, tpl.parent, tpl.parent.parent):
+        if (cand / "policy.yaml").is_file() or (cand / "config.example.yaml").is_file():
+            tpl = cand
+            break
     for src, dst in ((tpl / "config.example.yaml", cfg.home / "config.yaml"),):
         if dst.exists():
             continue
