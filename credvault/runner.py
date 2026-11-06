@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.parse
 
 from . import crypto, executor, redact, registry
 from .approvals import args_fp
@@ -33,6 +34,12 @@ def _execute(svc, cap: registry.Capability, args: dict, agent: dict,
         secrets[ref] = raw.decode("utf-8", errors="replace")
     primary = secrets.get(cap.secret_refs[0], "") if cap.secret_refs else ""
 
+    # 脱敏用的明文清单必须在 `secrets.clear()` **之前**快照。
+    # `finally` 在 try 正常退出时先于其后的语句执行，secrets 一旦被 clear，
+    # `list(secrets.values())` 就是空列表 → 第 2..N 条凭据明文不参与脱敏，
+    # 会随响应体和审计预览一起流回调用方（凭据泄漏）。
+    secret_values: list[str] = list(secrets.values())
+
     try:
         if cap.kind == "http":
             out = svc._do_http(cap, args, secrets, primary)
@@ -45,7 +52,8 @@ def _execute(svc, cap: registry.Capability, args: dict, agent: dict,
     finally:
         secrets.clear()
 
-    text, stat = redact.scrub(out["text"], [primary] + list(secrets.values()),
+    scrub_values = [primary] + secret_values
+    text, stat = redact.scrub(out["text"], scrub_values,
                               max_hits=int(svc.cfg.get("redact.max_hits", 200)),
                               extra_patterns=svc.cfg.get("redact.patterns"))
     budget = int(svc.policy.response_bytes or svc.cfg.get("limits.response_bytes", 32768))
@@ -61,7 +69,7 @@ def _execute(svc, cap: registry.Capability, args: dict, agent: dict,
         note=(f"{out.get('note','')} scrub={stat['hits']}"
               f"{' TRUNC' if tr.get('truncated') else ''}"),
         args_fp=args_fp(cap.name, args),
-        args_preview=svc._safe_args_preview(args, [primary] + list(secrets.values())),
+        args_preview=svc._safe_args_preview(args, scrub_values),
         extra={"status": out.get("status"), "on_behalf_of": on_behalf_of})
     return {
         "ok": ok, "code": out["code"], "capability": cap.name,

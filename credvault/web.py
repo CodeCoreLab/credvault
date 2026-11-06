@@ -27,6 +27,31 @@ from .store import now
 
 COOKIE = "cvsid"
 SESSIONS: dict[str, dict] = {}
+# 会话表上限：超过时强制淘汰最早的会话，防止长期运行内存无限增长。
+MAX_SESSIONS = 512
+_SESSIONS_LOCK = threading.RLock()
+
+
+def _sweep_sessions_locked(now_ts: float) -> int:
+    """清理过期会话并执行容量上限淘汰（调用方须已持有 _SESSIONS_LOCK）。
+
+    返回被清理的会话数。SESSIONS 保持插入序，所以「最早的会话」就是字典序头部。
+    """
+    expired = [sid for sid, rec in SESSIONS.items()
+               if rec.get("expires_at", 0) < now_ts]
+    for sid in expired:
+        SESSIONS.pop(sid, None)
+    overflow = len(SESSIONS) - MAX_SESSIONS
+    if overflow > 0:
+        for sid in list(SESSIONS)[:overflow]:
+            SESSIONS.pop(sid, None)
+    return len(expired)
+
+
+def purge_sessions() -> int:
+    """对外的会话清扫入口（供测试与定期调用）。"""
+    with _SESSIONS_LOCK:
+        return _sweep_sessions_locked(time.time())
 
 # ── access log（v1.2 曾整体静音，排障无据；这里恢复为走 logging）─────────────
 # 独立 logger "credvault.web"：默认 stderr（服务启动处装 handler），可另配文件
@@ -230,13 +255,14 @@ class Handler(BaseHTTPRequestHandler):
         sid = self._cookie(COOKIE)
         if not sid:
             return None
-        rec = SESSIONS.get(sid)
-        if not rec:
-            return None
-        if rec["expires_at"] < time.time():
-            SESSIONS.pop(sid, None)
-            return None
-        return rec
+        with _SESSIONS_LOCK:
+            rec = SESSIONS.get(sid)
+            if not rec:
+                return None
+            if rec["expires_at"] < time.time():
+                SESSIONS.pop(sid, None)
+                return None
+            return rec
 
     def _require_session(self) -> dict | None:
         s = self._session()
@@ -302,8 +328,10 @@ class Handler(BaseHTTPRequestHandler):
                                     "recent": self.svc_ref.approvals.recent(30),
                                     "exemptions": self.svc_ref.approvals.exemptions()})
         if p == "/api/audit":
-            hours = int((q.get("hours") or ["24"])[0])
-            rows = self.svc_ref.audit.search(limit=int((q.get("limit") or ["100"])[0]),
+            # 参数容错：非法整数回退默认值，不让 ValueError 冒泡成 500
+            hours = api_mod._qint(q, "hours", 24)
+            limit = api_mod._qint(q, "limit", 100)
+            rows = self.svc_ref.audit.search(limit=limit,
                                          since_epoch=now() - hours * 3600,
                                          capability=(q.get("capability") or [""])[0],
                                          keyword=(q.get("q") or [""])[0])
@@ -323,7 +351,8 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/logout":
             s = self._session()
             if s:
-                SESSIONS.pop(self._cookie(COOKIE), None)
+                with _SESSIONS_LOCK:
+                    SESSIONS.pop(self._cookie(COOKIE), None)
             return self._send(302, b"", headers={"Location": "/login",
                                                  "Set-Cookie": f"{COOKIE}=; Path=/; Max-Age=0"})
         if p == "/mcp":
@@ -433,8 +462,12 @@ class Handler(BaseHTTPRequestHandler):
         sid = secrets.token_urlsafe(24)
         csrf = secrets.token_urlsafe(16)
         ttl = int(self.svc_ref.cfg.get("web.session_ttl_min", 480)) * 60
-        SESSIONS[sid] = {"user": name, "role": row["role"], "csrf": csrf,
-                         "expires_at": time.time() + ttl}
+        with _SESSIONS_LOCK:
+            SESSIONS[sid] = {"user": name, "role": row["role"], "csrf": csrf,
+                             "expires_at": time.time() + ttl}
+            # 登录是唯一会持续新增会话的入口 —— 顺手清掉过期项并执行容量上限，
+            # 避免长时间运行 + 自动化反复登录导致内存无限增长。
+            _sweep_sessions_locked(time.time())
         with self.svc_ref.store.tx() as c:
             c.execute("INSERT INTO sessions(id,user_id,csrf,created_at,expires_at)"
                       " VALUES(?,?,?,?,?)", (sid, row["id"], csrf, now(), now() + ttl))
